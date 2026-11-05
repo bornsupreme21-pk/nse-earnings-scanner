@@ -1,0 +1,29 @@
+name: NSE Pre-Earnings Scanner
+
+on:
+  schedule:
+    # 2:30 AM UTC = 8:00 AM IST (Monday to Friday)
+    - cron: '30 2 * * 1-5'
+  workflow_dispatch: 
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Execute Quantitative Scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python earnings_scanner.py
