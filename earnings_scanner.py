@@ -87,10 +87,20 @@ def execute_market_scan(tickers):
     today = datetime.date.today()
     valid_setups = []
     
-    nifty = yf.download("^NSEI", period="6mo", progress=False)['Close']
-    if isinstance(nifty, pd.DataFrame):
-        nifty = nifty.squeeze()
-    nifty_1m_ret = (nifty.iloc[-1] - nifty.iloc[-21]) / nifty.iloc[-21]
+    # Robust fallback if Yahoo Finance blocks the NIFTY 50 download
+    try:
+        nifty = yf.download("^NSEI", period="6mo", progress=False)
+        if nifty.empty or 'Close' not in nifty or len(nifty) < 21:
+            print("Warning: NIFTY 50 download failed. Defaulting benchmark to 0%.")
+            nifty_1m_ret = 0.0
+        else:
+            nifty_close = nifty['Close']
+            if isinstance(nifty_close, pd.DataFrame):
+                nifty_close = nifty_close.squeeze()
+            nifty_1m_ret = (nifty_close.iloc[-1] - nifty_close.iloc[-21]) / nifty_close.iloc[-21]
+    except Exception as e:
+        print(f"Warning: NIFTY 50 error ({e}). Defaulting benchmark to 0%.")
+        nifty_1m_ret = 0.0
     
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(analyze_single_stock, t, today, nifty_1m_ret): t for t in tickers}
