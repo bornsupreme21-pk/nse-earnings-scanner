@@ -2,9 +2,13 @@ name: NSE Pre-Earnings Scanner
 
 on:
   schedule:
-    # 2:30 AM UTC = 8:00 AM IST (Monday to Friday)
+    # 8:00 AM IST (Pre-market prep)
     - cron: '30 2 * * 1-5'
-  workflow_dispatch: 
+    # 1:00 PM IST (Mid-day volume check)
+    - cron: '30 7 * * 1-5'
+    # 5:00 PM IST (Post-market review)
+    - cron: '30 11 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   run-scanner:
