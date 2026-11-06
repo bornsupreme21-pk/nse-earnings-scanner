@@ -138,3 +138,25 @@ if __name__ == "__main__":
             send_telegram_alert(found_setups)
         else:
             print("No stocks matched the strict pre-earnings criteria today.")
+            import json
+
+def log_to_google_sheet_webhook(dataframe):
+    """Sends scan results to a dedicated Google Sheet via Webhook."""
+    webhook_url = os.getenv('WEBHOOK_URL')
+    if not webhook_url:
+        print("Webhook URL missing. Skipping Sheets export.")
+        return
+
+    try:
+        dataframe.insert(0, 'Scan Date', str(datetime.date.today()))
+        payload = dataframe.to_dict(orient='records')
+        headers = {'Content-Type': 'application/json'}
+        
+        response = requests.post(webhook_url, data=json.dumps(payload), headers=headers)
+        
+        if response.status_code == 200:
+            print("Successfully logged data to the Google Sheet.")
+        else:
+            print(f"Failed to log to Google Sheets. Status: {response.status_code}")
+    except Exception as e:
+        print(f"Error connecting to Webhook: {e}")
