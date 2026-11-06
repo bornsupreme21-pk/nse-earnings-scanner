@@ -25,16 +25,22 @@ NSE_HEADERS = {
 }
 
 def get_all_nse_tickers():
-    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
-    try:
-        response = requests.get(url, headers=NSE_HEADERS, timeout=10)
-        df = pd.read_csv(io.StringIO(response.text))
-        df.columns = df.columns.str.strip()
-        df_eq = df[df['SERIES'] == 'EQ']
-        return [f"{symbol}.NS" for symbol in df_eq['SYMBOL']]
-    except Exception as e:
-        print(f"Failed to fetch NSE list: {e}")
-        return []
+    """Fetches Nifty 500 + Nifty Microcap 250 (750 Total Stocks) to balance scope and rate limits."""
+    urls = [
+        "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+        "https://archives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv"
+    ]
+    tickers = set()
+    for url in urls:
+        try:
+            response = requests.get(url, headers=NSE_HEADERS, timeout=10)
+            df = pd.read_csv(io.StringIO(response.text))
+            df.columns = df.columns.str.strip()
+            for symbol in df['Symbol']:
+                tickers.add(f"{symbol}.NS")
+        except Exception as e:
+            print(f"Failed to fetch list from {url}: {e}")
+    return list(tickers)
 
 def get_nse_board_meetings_fallback():
     """Fetches the live board meetings JSON directly from NSE as a fallback database."""
@@ -214,7 +220,7 @@ def execute_market_scan(tickers):
     nse_fallback_data = get_nse_board_meetings_fallback()
     print(f"Loaded {len(nse_fallback_data)} fallback dates from NSE.")
     
-    # Process in batches to avoid Yahoo Finance 429 Errors
+    # Process in carefully sized batches to completely avoid Yahoo Finance 429 Errors
     batch_size = 50
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
@@ -225,8 +231,8 @@ def execute_market_scan(tickers):
                 if res:
                     master_calendar.append(res['calendar'])
                     if res['quant']: quant_setups.append(res['quant'])
-        # Pause slightly between batches
-        time.sleep(1.5)
+        # A vital 2-second pause between batches keeps the server invisible to Yahoo's security
+        time.sleep(2.0)
                 
     cal_df = pd.DataFrame(master_calendar)
     if not cal_df.empty:
@@ -253,7 +259,6 @@ def push_to_webhook(data_type, dataframe):
     url = os.getenv('WEBHOOK_URL')
     if not url or dataframe.empty: return
     try:
-        # Pushing in smaller chunks can also help with payload size
         chunk_size = 500
         records = dataframe.to_dict(orient='records')
         for i in range(0, len(records), chunk_size):
