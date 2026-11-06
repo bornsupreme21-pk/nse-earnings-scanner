@@ -156,6 +156,16 @@ def log_to_google_sheet_webhook(dataframe):
         
         if response.status_code == 200:
             print("Successfully logged data to the Google Sheet.")
+            if __name__ == "__main__":
+    nse_watchlist = get_all_nse_tickers()
+    if nse_watchlist:
+        found_setups = execute_market_scan(nse_watchlist)
+        if not found_setups.empty:
+            print(found_setups.to_string(index=False))
+            send_telegram_alert(found_setups)
+            log_to_google_sheet_webhook(found_setups) # <--- ADDED HERE
+        else:
+            print("No stocks matched the strict pre-earnings criteria today.")
         else:
             print(f"Failed to log to Google Sheets. Status: {response.status_code}")
     except Exception as e:
