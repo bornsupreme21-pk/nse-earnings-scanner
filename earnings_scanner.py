@@ -5,6 +5,7 @@ import io
 import datetime
 import os
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Regime Parameters ---
@@ -38,28 +39,25 @@ def get_all_nse_tickers():
 def get_nse_board_meetings_fallback():
     """Fetches the live board meetings JSON directly from NSE as a fallback database."""
     try:
-        # Step 1: Hit the homepage to get valid session cookies
         session = requests.Session()
         session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
         
-        # Step 2: Fetch the actual JSON data
         api_url = "https://www.nseindia.com/api/corporate-board-meetings"
         res = session.get(api_url, headers=NSE_HEADERS, timeout=10)
         data = res.json()
         
-        # Map Symbol to Date
         fallback_dict = {}
         for item in data:
             if 'Financial Results' in item.get('purpose', ''):
                 symbol = f"{item.get('symbol')}.NS"
-                date_str = item.get('bm_date') # Format: DD-MMM-YYYY
+                date_str = item.get('bm_date') 
                 try:
                     fallback_dict[symbol] = datetime.datetime.strptime(date_str, "%d-%b-%Y").date()
                 except:
                     pass
         return fallback_dict
     except Exception:
-        return {} # Return empty dict if NSE blocks the request
+        return {} 
 
 def format_percentage(val):
     if val is None or pd.isna(val): return "N/A"
@@ -216,13 +214,19 @@ def execute_market_scan(tickers):
     nse_fallback_data = get_nse_board_meetings_fallback()
     print(f"Loaded {len(nse_fallback_data)} fallback dates from NSE.")
     
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(analyze_single_stock, t, today, nifty_1m_ret, nse_fallback_data): t for t in tickers}
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                master_calendar.append(res['calendar'])
-                if res['quant']: quant_setups.append(res['quant'])
+    # Process in batches to avoid Yahoo Finance 429 Errors
+    batch_size = 50
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(analyze_single_stock, t, today, nifty_1m_ret, nse_fallback_data): t for t in batch}
+            for future in as_completed(futures):
+                res = future.result()
+                if res:
+                    master_calendar.append(res['calendar'])
+                    if res['quant']: quant_setups.append(res['quant'])
+        # Pause slightly between batches
+        time.sleep(1.5)
                 
     cal_df = pd.DataFrame(master_calendar)
     if not cal_df.empty:
@@ -249,8 +253,13 @@ def push_to_webhook(data_type, dataframe):
     url = os.getenv('WEBHOOK_URL')
     if not url or dataframe.empty: return
     try:
-        payload = {"type": data_type, "data": dataframe.to_dict(orient='records')}
-        requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
+        # Pushing in smaller chunks can also help with payload size
+        chunk_size = 500
+        records = dataframe.to_dict(orient='records')
+        for i in range(0, len(records), chunk_size):
+            chunk = records[i:i + chunk_size]
+            payload = {"type": data_type, "data": chunk}
+            requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
     except Exception as e:
         print(f"Webhook error ({data_type}): {e}")
 
