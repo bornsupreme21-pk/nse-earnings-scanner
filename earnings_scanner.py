@@ -136,10 +136,9 @@ if __name__ == "__main__":
         if not found_setups.empty:
             print(found_setups.to_string(index=False))
             send_telegram_alert(found_setups)
+            log_to_google_sheet_webhook(found_setups)
         else:
             print("No stocks matched the strict pre-earnings criteria today.")
-            import json
-
 def log_to_google_sheet_webhook(dataframe):
     """Sends scan results to a dedicated Google Sheet via Webhook."""
     webhook_url = os.getenv('WEBHOOK_URL')
