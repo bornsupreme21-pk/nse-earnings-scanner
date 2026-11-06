@@ -4,6 +4,7 @@ import requests
 import io
 import datetime
 import os
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration & Regime Parameters ---
@@ -74,11 +75,11 @@ def analyze_single_stock(ticker, today, nifty_returns):
             
         return {
             'Ticker': ticker.replace('.NS', ''),
-            'Earnings': str(earnings_date),
-            'Days': days_until_earnings,
+            'Earnings Date': str(earnings_date),
+            'Days to Earnings': days_until_earnings,
             'CMP': round(latest['Close'], 2),
             '1M Rally (%)': round(monthly_return, 2),
-            'Support': '20 EMA' if near_ema20 else '50 EMA'
+            'Support Level': '20 EMA' if near_ema20 else '50 EMA'
         }
     except Exception:
         return None
@@ -110,7 +111,7 @@ def execute_market_scan(tickers):
                 valid_setups.append(result)
                 
     if valid_setups:
-        return pd.DataFrame(valid_setups).sort_values(by='Days')
+        return pd.DataFrame(valid_setups).sort_values(by='Days to Earnings')
     return pd.DataFrame()
 
 def send_telegram_alert(dataframe):
@@ -129,16 +130,6 @@ def send_telegram_alert(dataframe):
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "MarkdownV2"}
     requests.post(url, json=payload)
 
-if __name__ == "__main__":
-    nse_watchlist = get_all_nse_tickers()
-    if nse_watchlist:
-        found_setups = execute_market_scan(nse_watchlist)
-        if not found_setups.empty:
-            print(found_setups.to_string(index=False))
-            send_telegram_alert(found_setups)
-            log_to_google_sheet_webhook(found_setups)
-        else:
-            print("No stocks matched the strict pre-earnings criteria today.")
 def log_to_google_sheet_webhook(dataframe):
     """Sends scan results to a dedicated Google Sheet via Webhook."""
     webhook_url = os.getenv('WEBHOOK_URL')
@@ -155,17 +146,18 @@ def log_to_google_sheet_webhook(dataframe):
         
         if response.status_code == 200:
             print("Successfully logged data to the Google Sheet.")
-            if __name__ == "__main__":
+        else:
+            print(f"Failed to log to Google Sheets. Status: {response.status_code}")
+    except Exception as e:
+        print(f"Error connecting to Webhook: {e}")
+
+if __name__ == "__main__":
     nse_watchlist = get_all_nse_tickers()
     if nse_watchlist:
         found_setups = execute_market_scan(nse_watchlist)
         if not found_setups.empty:
             print(found_setups.to_string(index=False))
             send_telegram_alert(found_setups)
-            log_to_google_sheet_webhook(found_setups) # <--- ADDED HERE
+            log_to_google_sheet_webhook(found_setups)
         else:
             print("No stocks matched the strict pre-earnings criteria today.")
-        else:
-            print(f"Failed to log to Google Sheets. Status: {response.status_code}")
-    except Exception as e:
-        print(f"Error connecting to Webhook: {e}")
