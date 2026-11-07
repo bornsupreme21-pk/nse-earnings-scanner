@@ -98,14 +98,12 @@ def execute_bulk_scan(tickers):
         nifty_1m_ret = (nifty.iloc[-1] - nifty.iloc[-21]) / nifty.iloc[-21]
     except: nifty_1m_ret = 0.0
 
-    # --- THE FIX: Batch Processing to Destroy 429 Errors ---
     batch_size = 50
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i+batch_size]
         print(f"Processing Batch {i//batch_size + 1} of {(len(tickers)//batch_size)+1}...")
         
         try:
-            # Download 50 at a time
             data = yf.download(batch, period="1y", progress=False, group_by="ticker", threads=True)
         except Exception as e:
             print(f"Batch failed: {e}")
@@ -118,7 +116,6 @@ def execute_bulk_scan(tickers):
 
         for ticker in batch:
             try:
-                # --- THE FIX: Safe Pandas MultiIndex Checking ---
                 if isinstance(data.columns, pd.MultiIndex):
                     if ticker not in data.columns.get_level_values(0): 
                         continue
@@ -140,7 +137,6 @@ def execute_bulk_scan(tickers):
                 cmp = round(c.iloc[-1], 2)
                 if cmp < MIN_PRICE_FILTER: continue
 
-                # Date Logic
                 e_date = nse_dates.get(ticker)
                 if e_date:
                     days_until_earnings = (e_date - today).days
@@ -150,7 +146,6 @@ def execute_bulk_scan(tickers):
                     earnings_date_str = "Unknown"
                     days_until_earnings = "N/A"
 
-                # 1. Base Calendar Data
                 cal_data = {
                     'Scan Date': str(today),
                     'Ticker': ticker.replace('.NS', ''),
@@ -165,7 +160,6 @@ def execute_bulk_scan(tickers):
                 }
                 master_calendar.append(cal_data)
 
-                # 2. Quant Math
                 if days_until_earnings == "N/A" or days_until_earnings <= QUANT_DAYS:
                     ema20 = c.ewm(span=20, adjust=False).mean()
                     ema50 = c.ewm(span=50, adjust=False).mean()
@@ -194,7 +188,6 @@ def execute_bulk_scan(tickers):
                     
                     dist_52w = ((cmp - h.max()) / h.max()) * 100
                     
-                    # Strict Gates
                     if (MIN_RSI <= latest_rsi <= 78) and (monthly_return <= MAX_RALLY_PCT) and (vol_mult >= MIN_VOLUME_MULTIPLIER):
                         if (abs(cmp - latest_ema20) / latest_ema20 <= EMA_PROXIMITY_PCT or abs(cmp - latest_ema50) / latest_ema50 <= EMA_PROXIMITY_PCT):
                             if ((cmp - c.iloc[-21]) / c.iloc[-21]) >= nifty_returns:
@@ -223,7 +216,6 @@ def execute_bulk_scan(tickers):
             except Exception as e:
                 continue
                 
-        # Vital pause to clear Yahoo Finance security cache
         time.sleep(2)
 
     cal_df = pd.DataFrame(master_calendar)
@@ -253,4 +245,25 @@ def push_to_webhook(data_type, dataframe):
     try:
         chunk_size = 500
         records = dataframe.to_dict(orient='records')
-        for i
+        for i in range(0, len(records), chunk_size):
+            chunk = records[i:i + chunk_size]
+            payload = {"type": data_type, "data": chunk}
+            requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
+    except Exception as e:
+        print(f"Webhook error ({data_type}): {e}")
+
+if __name__ == "__main__":
+    nse_watchlist = get_all_nse_tickers()
+    if nse_watchlist:
+        cal_df, quant_df = execute_bulk_scan(nse_watchlist)
+        
+        if not cal_df.empty:
+            print(f"Found {len(cal_df)} stocks for the 30-Day Earnings Library.")
+            push_to_webhook("calendar", cal_df)
+            
+        if not quant_df.empty:
+            print(f"Found {len(quant_df)} actionable Quant setups.")
+            push_to_webhook("quant", quant_df)
+            send_telegram_alert(quant_df)
+        else:
+            print("No stocks passed the strict Quant filter today.")
