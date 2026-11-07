@@ -5,6 +5,7 @@ import io
 import datetime
 import os
 import json
+import time
 import warnings
 
 # Suppress yfinance warnings for clean logs
@@ -91,114 +92,139 @@ def execute_bulk_scan(tickers):
     nse_dates = get_nse_board_meetings_fallback()
     print(f"Loaded {len(nse_dates)} official earnings dates from NSE.")
 
-    print(f"Executing Bulk Vector Download for {len(tickers)} stocks. This bypasses Yahoo's firewall...")
-    # Bulk download bypasses the 429 QuoteSummary error completely
-    data = yf.download(tickers, period="1y", progress=False, group_by="ticker", threads=True)
-    
     try:
         nifty = yf.download("^NSEI", period="1y", progress=False)['Close']
         if isinstance(nifty, pd.DataFrame): nifty = nifty.squeeze()
         nifty_1m_ret = (nifty.iloc[-1] - nifty.iloc[-21]) / nifty.iloc[-21]
     except: nifty_1m_ret = 0.0
 
-    print("Crunching Quantitative Math...")
-    for ticker in tickers:
+    # --- THE FIX: Batch Processing to Destroy 429 Errors ---
+    batch_size = 50
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i+batch_size]
+        print(f"Processing Batch {i//batch_size + 1} of {(len(tickers)//batch_size)+1}...")
+        
         try:
-            if ticker not in data.columns.levels[0]: continue
-            
-            df = data[ticker].dropna(subset=['Close'])
-            if len(df) < 50: continue
-            
-            c = df['Close']
-            v = df['Volume']
-            h = df['High']
-            l = df['Low']
-            
-            cmp = round(c.iloc[-1], 2)
-            if cmp < MIN_PRICE_FILTER: continue
-
-            # Date Logic
-            e_date = nse_dates.get(ticker)
-            if e_date:
-                days_until_earnings = (e_date - today).days
-                if days_until_earnings < 0 or days_until_earnings > LIBRARY_DAYS: continue
-                earnings_date_str = str(e_date)
-            else:
-                earnings_date_str = "Unknown"
-                days_until_earnings = "N/A"
-
-            # 1. Base Calendar Data
-            cal_data = {
-                'Scan Date': str(today),
-                'Ticker': ticker.replace('.NS', ''),
-                'Sector': 'N/A', # Bypassed to prevent block
-                'Earnings Date': earnings_date_str,
-                'Days': days_until_earnings,
-                'CMP': cmp,
-                'Market Cap': 'N/A',
-                'Rev Growth': 'N/A',
-                'Earnings Growth': 'N/A',
-                'Div Yield': 'N/A'
-            }
-            master_calendar.append(cal_data)
-
-            # 2. Quant Math
-            if days_until_earnings == "N/A" or days_until_earnings <= QUANT_DAYS:
-                ema20 = c.ewm(span=20, adjust=False).mean()
-                ema50 = c.ewm(span=50, adjust=False).mean()
-                vol_sma20 = v.rolling(20).mean()
-                
-                delta = c.diff()
-                gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-                loss = -1 * delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
-                rsi_series = 100 - (100 / (1 + (gain / loss)))
-                
-                prev_c = c.shift(1)
-                tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-                atr_series = tr.rolling(14).mean()
-                
-                latest_rsi = rsi_series.iloc[-1]
-                latest_atr = atr_series.iloc[-1]
-                latest_ema20 = ema20.iloc[-1]
-                latest_ema50 = ema50.iloc[-1]
-                
-                prev_month = c.iloc[-21] if len(c) > 21 else c.iloc[0]
-                monthly_return = ((cmp - prev_month) / prev_month) * 100
-                
-                recent_vol = v.iloc[-5:]
-                avg_vol = vol_sma20.iloc[-5:].mean()
-                vol_mult = recent_vol.max() / avg_vol if avg_vol > 0 else 0
-                
-                dist_52w = ((cmp - h.max()) / h.max()) * 100
-                
-                # Strict Gates
-                if (MIN_RSI <= latest_rsi <= 78) and (monthly_return <= MAX_RALLY_PCT) and (vol_mult >= MIN_VOLUME_MULTIPLIER):
-                    if (abs(cmp - latest_ema20) / latest_ema20 <= EMA_PROXIMITY_PCT or abs(cmp - latest_ema50) / latest_ema50 <= EMA_PROXIMITY_PCT):
-                        if ((cmp - c.iloc[-21]) / c.iloc[-21]) >= nifty_returns:
-                            
-                            ai_score, decision = calculate_ai_score(latest_rsi, vol_mult, dist_52w)
-                            
-                            quant_data = {
-                                'Scan Date': str(today),
-                                'Decision': decision,
-                                'AI Score': ai_score,
-                                'Ticker': ticker.replace('.NS', ''),
-                                'Sector': 'N/A',
-                                'Earnings Date': earnings_date_str,
-                                'Days': days_until_earnings,
-                                'CMP': cmp,
-                                'Target': round(cmp + max((cmp * 0.06), (2.5 * latest_atr)), 2),
-                                'Stop Loss': round(cmp - (1.5 * latest_atr), 2),
-                                'RSI': round(latest_rsi, 2),
-                                'Vol Spike': f"{vol_mult:.1f}x",
-                                'PE Ratio': 'N/A',
-                                'P/B Ratio': 'N/A',
-                                'Debt/Equity': 'N/A',
-                                '52W High Dist (%)': round(dist_52w, 2)
-                            }
-                            quant_setups.append(quant_data)
+            # Download 50 at a time
+            data = yf.download(batch, period="1y", progress=False, group_by="ticker", threads=True)
         except Exception as e:
+            print(f"Batch failed: {e}")
+            time.sleep(2)
             continue
+            
+        if data.empty:
+            time.sleep(2)
+            continue
+
+        for ticker in batch:
+            try:
+                # --- THE FIX: Safe Pandas MultiIndex Checking ---
+                if isinstance(data.columns, pd.MultiIndex):
+                    if ticker not in data.columns.get_level_values(0): 
+                        continue
+                    df = data[ticker].dropna(subset=['Close'])
+                else:
+                    if len(batch) == 1: 
+                        df = data.dropna(subset=['Close'])
+                    else: 
+                        continue
+                        
+                if len(df) < 50: 
+                    continue
+                
+                c = df['Close']
+                v = df['Volume']
+                h = df['High']
+                l = df['Low']
+                
+                cmp = round(c.iloc[-1], 2)
+                if cmp < MIN_PRICE_FILTER: continue
+
+                # Date Logic
+                e_date = nse_dates.get(ticker)
+                if e_date:
+                    days_until_earnings = (e_date - today).days
+                    if days_until_earnings < 0 or days_until_earnings > LIBRARY_DAYS: continue
+                    earnings_date_str = str(e_date)
+                else:
+                    earnings_date_str = "Unknown"
+                    days_until_earnings = "N/A"
+
+                # 1. Base Calendar Data
+                cal_data = {
+                    'Scan Date': str(today),
+                    'Ticker': ticker.replace('.NS', ''),
+                    'Sector': 'N/A', 
+                    'Earnings Date': earnings_date_str,
+                    'Days': days_until_earnings,
+                    'CMP': cmp,
+                    'Market Cap': 'N/A',
+                    'Rev Growth': 'N/A',
+                    'Earnings Growth': 'N/A',
+                    'Div Yield': 'N/A'
+                }
+                master_calendar.append(cal_data)
+
+                # 2. Quant Math
+                if days_until_earnings == "N/A" or days_until_earnings <= QUANT_DAYS:
+                    ema20 = c.ewm(span=20, adjust=False).mean()
+                    ema50 = c.ewm(span=50, adjust=False).mean()
+                    vol_sma20 = v.rolling(20).mean()
+                    
+                    delta = c.diff()
+                    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+                    loss = -1 * delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
+                    rsi_series = 100 - (100 / (1 + (gain / loss)))
+                    
+                    prev_c = c.shift(1)
+                    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+                    atr_series = tr.rolling(14).mean()
+                    
+                    latest_rsi = rsi_series.iloc[-1]
+                    latest_atr = atr_series.iloc[-1]
+                    latest_ema20 = ema20.iloc[-1]
+                    latest_ema50 = ema50.iloc[-1]
+                    
+                    prev_month = c.iloc[-21] if len(c) > 21 else c.iloc[0]
+                    monthly_return = ((cmp - prev_month) / prev_month) * 100
+                    
+                    recent_vol = v.iloc[-5:]
+                    avg_vol = vol_sma20.iloc[-5:].mean()
+                    vol_mult = recent_vol.max() / avg_vol if avg_vol > 0 else 0
+                    
+                    dist_52w = ((cmp - h.max()) / h.max()) * 100
+                    
+                    # Strict Gates
+                    if (MIN_RSI <= latest_rsi <= 78) and (monthly_return <= MAX_RALLY_PCT) and (vol_mult >= MIN_VOLUME_MULTIPLIER):
+                        if (abs(cmp - latest_ema20) / latest_ema20 <= EMA_PROXIMITY_PCT or abs(cmp - latest_ema50) / latest_ema50 <= EMA_PROXIMITY_PCT):
+                            if ((cmp - c.iloc[-21]) / c.iloc[-21]) >= nifty_returns:
+                                
+                                ai_score, decision = calculate_ai_score(latest_rsi, vol_mult, dist_52w)
+                                
+                                quant_data = {
+                                    'Scan Date': str(today),
+                                    'Decision': decision,
+                                    'AI Score': ai_score,
+                                    'Ticker': ticker.replace('.NS', ''),
+                                    'Sector': 'N/A',
+                                    'Earnings Date': earnings_date_str,
+                                    'Days': days_until_earnings,
+                                    'CMP': cmp,
+                                    'Target': round(cmp + max((cmp * 0.06), (2.5 * latest_atr)), 2),
+                                    'Stop Loss': round(cmp - (1.5 * latest_atr), 2),
+                                    'RSI': round(latest_rsi, 2),
+                                    'Vol Spike': f"{vol_mult:.1f}x",
+                                    'PE Ratio': 'N/A',
+                                    'P/B Ratio': 'N/A',
+                                    'Debt/Equity': 'N/A',
+                                    '52W High Dist (%)': round(dist_52w, 2)
+                                }
+                                quant_setups.append(quant_data)
+            except Exception as e:
+                continue
+                
+        # Vital pause to clear Yahoo Finance security cache
+        time.sleep(2)
 
     cal_df = pd.DataFrame(master_calendar)
     if not cal_df.empty:
@@ -227,25 +253,4 @@ def push_to_webhook(data_type, dataframe):
     try:
         chunk_size = 500
         records = dataframe.to_dict(orient='records')
-        for i in range(0, len(records), chunk_size):
-            chunk = records[i:i + chunk_size]
-            payload = {"type": data_type, "data": chunk}
-            requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
-    except Exception as e:
-        print(f"Webhook error ({data_type}): {e}")
-
-if __name__ == "__main__":
-    nse_watchlist = get_all_nse_tickers()
-    if nse_watchlist:
-        cal_df, quant_df = execute_bulk_scan(nse_watchlist)
-        
-        if not cal_df.empty:
-            print(f"Found {len(cal_df)} stocks for the 30-Day Earnings Library.")
-            push_to_webhook("calendar", cal_df)
-            
-        if not quant_df.empty:
-            print(f"Found {len(quant_df)} actionable Quant setups.")
-            push_to_webhook("quant", quant_df)
-            send_telegram_alert(quant_df)
-        else:
-            print("No stocks passed the strict Quant filter today.")
+        for i
