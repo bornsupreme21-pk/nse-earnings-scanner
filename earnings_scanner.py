@@ -32,26 +32,26 @@ def parse_earnings_date(ts_val, today):
     except Exception:
         return "Unknown", "N/A"
 
-def calculate_blast_score(rsi, vol_mult, dist_52w, chg_1w, chg_1m, qtr_rev_gr, qtr_eps_gr, adx, days_left):
+def calculate_blast_score(rsi, vol_mult, dist_52w, chg_1w, chg_1m, qtr_rev_gr, qtr_eps_gr, op_margin, roe, adx, days_left):
     """
     100-Point Institutional Blast Predictor:
-    Combines Technical Ignition (55 pts) + Fundamental Acceleration (35 pts) + Catalyst Proximity (10 pts).
+    Technical Ignition (45 pts) + Fundamental Acceleration & Quality (45 pts) + Catalyst Proximity (10 pts).
     """
     score = 0
     
-    # 1. Technical Momentum & Trend Strength (Max 20 pts)
-    if 58 <= rsi <= 72: score += 12
-    elif 50 <= rsi < 58: score += 8
-    elif 47 <= rsi < 50 or 72 < rsi <= 78: score += 5
+    # 1. Technical Momentum & Trend Strength (Max 15 pts)
+    if 58 <= rsi <= 72: score += 10
+    elif 50 <= rsi < 58: score += 7
+    elif 47 <= rsi < 50 or 72 < rsi <= 78: score += 4
     
-    if adx is not None and adx >= 25: score += 8
-    elif adx is not None and adx >= 18: score += 4
+    if adx is not None and adx >= 25: score += 5
+    elif adx is not None and adx >= 18: score += 3
 
-    # 2. Institutional Volume Footprint / RVOL (Max 20 pts)
-    if vol_mult >= 2.5: score += 20
-    elif vol_mult >= 1.8: score += 15
-    elif vol_mult >= 1.3: score += 10
-    elif vol_mult >= 1.1: score += 5
+    # 2. Institutional Volume Footprint / RVOL (Max 15 pts)
+    if vol_mult >= 2.5: score += 15
+    elif vol_mult >= 1.8: score += 12
+    elif vol_mult >= 1.3: score += 8
+    elif vol_mult >= 1.1: score += 4
 
     # 3. 52-Week High Breakout Coil & Short-Term RS (Max 15 pts)
     if -5.0 <= dist_52w <= 0: score += 10
@@ -61,22 +61,37 @@ def calculate_blast_score(rsi, vol_mult, dist_52w, chg_1w, chg_1m, qtr_rev_gr, q
     if (chg_1w or 0) > 2.0 and (chg_1m or 0) > 4.0: score += 5
     elif (chg_1w or 0) > 0: score += 3
 
-    # 4. Quarterly Revenue & Profit Growth Acceleration (Max 35 pts)
+    # 4. Quarterly Revenue & Profit Growth Acceleration (Max 30 pts)
     if qtr_rev_gr is not None:
-        if qtr_rev_gr >= 25: score += 15
-        elif qtr_rev_gr >= 15: score += 11
-        elif qtr_rev_gr >= 5: score += 6
+        if qtr_rev_gr >= 25: score += 13
+        elif qtr_rev_gr >= 15: score += 10
+        elif qtr_rev_gr >= 5: score += 5
     else:
-        score += 5 # Neutral weight if unreported
+        score += 5
 
     if qtr_eps_gr is not None:
-        if qtr_eps_gr >= 30: score += 20
-        elif qtr_eps_gr >= 15: score += 14
-        elif qtr_eps_gr > 0: score += 8
+        if qtr_eps_gr >= 30: score += 17
+        elif qtr_eps_gr >= 15: score += 12
+        elif qtr_eps_gr > 0: score += 6
     else:
-        score += 7 # Neutral weight if unreported
+        score += 6
 
-    # 5. Pre-Earnings Catalyst Window (Max 10 pts)
+    # 5. Core Business Quality: Operating Margin & ROE (Max 15 pts)
+    if op_margin is not None:
+        if op_margin >= 20: score += 7
+        elif op_margin >= 12: score += 5
+        elif op_margin > 5: score += 2
+    else:
+        score += 3
+
+    if roe is not None:
+        if roe >= 20: score += 8
+        elif roe >= 15: score += 6
+        elif roe >= 10: score += 3
+    else:
+        score += 3
+
+    # 6. Pre-Earnings Catalyst Window (Max 10 pts)
     if isinstance(days_left, int):
         if 1 <= days_left <= 7: score += 10
         elif 8 <= days_left <= 15: score += 7
@@ -98,19 +113,22 @@ def calculate_blast_score(rsi, vol_mult, dist_52w, chg_1w, chg_1m, qtr_rev_gr, q
     return score, decision
 
 def fetch_nse_market_data():
-    """Fetches top 750 NSE stocks with full price history, 52W H/L, and Quarterly Growth."""
+    """Fetches top 750 NSE stocks with Price, Technicals, Qtr Growth, ROE, Op Margin, and Beta."""
     print("Querying Institutional Screener for 750 NSE stocks...")
+    cols = [
+        'name', 'sector', 'close', 'change', 'Perf.W', 'Perf.1M',
+        'volume', 'average_volume_30d_calc', 'relative_volume_10d_calc',
+        'RSI', 'ADX', 'EMA20', 'EMA50', 'ATR', 'beta_1_year',
+        'price_52_week_high', 'price_52_week_low',
+        'total_revenue_yoy_growth_fq', 'earnings_per_share_diluted_yoy_growth_fq',
+        'operating_margin_ttm', 'return_on_equity',
+        'earnings_release_next_date',
+        'price_earnings_ttm', 'price_book_fq', 'debt_to_equity', 'market_cap_basic'
+    ]
+    
     q = (Query()
          .set_markets('india')
-         .select(
-             'name', 'sector', 'close', 'change', 'Perf.W', 'Perf.1M',
-             'volume', 'average_volume_30d_calc', 'relative_volume_10d_calc',
-             'RSI', 'ADX', 'EMA20', 'EMA50', 'ATR',
-             'price_52_week_high', 'price_52_week_low',
-             'total_revenue_yoy_growth_fq', 'earnings_per_share_diluted_yoy_growth_fq',
-             ' earnings_release_next_TradingView_date', 'earnings_release_next_date',
-             'price_earnings_ttm', 'price_book_fq', 'debt_to_equity', 'market_cap_basic'
-         )
+         .select(*cols)
          .where(
              Column('exchange') == 'NSE',
              Column('close') >= MIN_PRICE_FILTER,
@@ -119,30 +137,7 @@ def fetch_nse_market_data():
          .order_by('market_cap_basic', ascending=False)
          .limit(750))
 
-    # Fallback select list if TradingView updates column alias for earnings date
-    try:
-        _, df = q.get_scanner_data()
-    except Exception:
-        q = (Query()
-             .set_markets('india')
-             .select(
-                 'name', 'sector', 'close', 'change', 'Perf.W', 'Perf.1M',
-                 'volume', 'average_volume_30d_calc', 'relative_volume_10d_calc',
-                 'RSI', 'ADX', 'EMA20', 'EMA50', 'ATR',
-                 'price_52_week_high', 'price_52_week_low',
-                 'total_revenue_yoy_growth_fq', 'earnings_per_share_diluted_yoy_growth_fq',
-                 'earnings_release_next_date',
-                 'price_earnings_ttm', 'price_book_fq', 'debt_to_equity', 'market_cap_basic'
-             )
-             .where(
-                 Column('exchange') == 'NSE',
-                 Column('close') >= MIN_PRICE_FILTER,
-                 Column('average_volume_30d_calc') > 50000
-             )
-             .order_by('market_cap_basic', ascending=False)
-             .limit(750))
-        _, df = q.get_scanner_data()
-
+    _, df = q.get_scanner_data()
     print(f"Downloaded {len(df)} NSE stocks successfully.")
     return df
 
@@ -172,6 +167,7 @@ def process_scanner_data(df):
 
             rsi = round(safe_float(row.get('RSI'), 0.0), 2)
             adx = round(safe_float(row.get('ADX'), 0.0), 2)
+            beta = safe_float(row.get('beta_1_year'))
             ema20 = safe_float(row.get('EMA20'), cmp)
             ema50 = safe_float(row.get('EMA50'), cmp)
             atr = safe_float(row.get('ATR'), cmp * 0.02)
@@ -182,6 +178,8 @@ def process_scanner_data(df):
 
             qtr_rev_gr = safe_float(row.get('total_revenue_yoy_growth_fq'))
             qtr_eps_gr = safe_float(row.get('earnings_per_share_diluted_yoy_growth_fq'))
+            op_margin = safe_float(row.get('operating_margin_ttm'))
+            roe = safe_float(row.get('return_on_equity'))
 
             pe = safe_float(row.get('price_earnings_ttm'))
             pb = safe_float(row.get('price_book_fq'))
@@ -191,7 +189,8 @@ def process_scanner_data(df):
             e_date_str, days_left = parse_earnings_date(row.get('earnings_release_next_date'), today)
 
             ai_score, decision = calculate_blast_score(
-                rsi, vol_mult, dist_52w, chg_1w, chg_1m, qtr_rev_gr, qtr_eps_gr, adx, days_left
+                rsi, vol_mult, dist_52w, chg_1w, chg_1m,
+                qtr_rev_gr, qtr_eps_gr, op_margin, roe, adx, days_left
             )
 
             buy_low = round(min(cmp, ema20), 2)
@@ -218,18 +217,21 @@ def process_scanner_data(df):
                 'RSI': rsi,
                 'Vol Spike': f"{vol_mult:.1f}x",
                 'ADX': adx,
+                '1Y Beta': round(beta, 2) if beta is not None else "N/A",
                 '52W High': high_52w,
                 '52W Low': low_52w,
                 '52W High Dist (%)': dist_52w,
                 'Qtr Sales Gr (%)': round(qtr_rev_gr, 2) if qtr_rev_gr is not None else "N/A",
                 'Qtr Profit Gr (%)': round(qtr_eps_gr, 2) if qtr_eps_gr is not None else "N/A",
+                'Op Margin (%)': round(op_margin, 2) if op_margin is not None else "N/A",
+                'ROE (%)': round(roe, 2) if roe is not None else "N/A",
                 'PE Ratio': round(pe, 2) if pe is not None else "N/A",
                 'P/B Ratio': round(pb, 2) if pb is not None else "N/A",
                 'Debt/Equity': round(debt_eq, 2) if debt_eq is not None else "N/A",
                 'MCap (Cr)': mcap_cr
             }
 
-            # 1. Populate 30-Day Earnings Library (Upcoming catalysts or top 300 liquid stocks)
+            # 1. Populate 30-Day Earnings Library
             if (isinstance(days_left, int) and 0 <= days_left <= LIBRARY_DAYS) or len(library_list) < 300:
                 library_list.append(record)
 
@@ -241,15 +243,17 @@ def process_scanner_data(df):
 
             near_ema20 = abs(cmp - ema20) / ema20 <= EMA_PROXIMITY_PCT if ema20 > 0 else False
             near_ema50 = abs(cmp - ema50) / ema50 <= EMA_PROXIMITY_PCT if ema50 > 0 else False
-            near_52w_breakout = -6.0 <= dist_52w <= 0.5  # Catch tight 52W High consolidations
+            near_52w_breakout = -6.0 <= dist_52w <= 0.5
             if not (near_ema20 or near_ema50 or near_52w_breakout):
                 continue
 
-            # Exclude stocks with collapsing quarterly sales/profit if reported
+            # Fundamental Quality & Fake-Profit Protection Gates
             if qtr_rev_gr is not None and qtr_rev_gr < -10:
                 continue
             if qtr_eps_gr is not None and qtr_eps_gr < -15:
                 continue
+            if op_margin is not None and op_margin <= 0:
+                continue  # Blocks negative core operating margin ("Other Income" traps)
 
             quant_setups.append(record)
 
@@ -285,7 +289,7 @@ def push_notifications(quant_df, library_list):
             print(f"Google Sheets Webhook Failed: {e}")
 
     if token and chat_id and not quant_df.empty:
-        top_df = quant_df[['Decision', 'AI Score', 'Ticker', 'CMP', '1W Chg (%)', 'Target']].head(15)
+        top_df = quant_df[['Decision', 'AI Score', 'Ticker', 'CMP', 'ROE (%)', 'Target']].head(15)
         msg = (
             f"<b>🚀 QUANT-FUNDY BLAST SCANNER ({len(quant_df)} Setups)</b>\n\n"
             f"<pre>{top_df.to_string(index=False)}</pre>"
@@ -304,5 +308,5 @@ if __name__ == "__main__":
     quant_df, library_list = process_scanner_data(raw_df)
     print(f"Actionable Blast Setups Found: {len(quant_df)}")
     if not quant_df.empty:
-        print(quant_df[['Decision', 'AI Score', 'Ticker', 'CMP', 'Qtr Sales Gr (%)', 'Qtr Profit Gr (%)']].head(10).to_string(index=False))
+        print(quant_df[['Decision', 'AI Score', 'Ticker', 'CMP', 'Op Margin (%)', 'ROE (%)']].head(10).to_string(index=False))
     push_notifications(quant_df, library_list)
