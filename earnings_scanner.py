@@ -1,246 +1,187 @@
-import yfinance as yf
-import pandas as pd
-import requests
-import io
-import datetime
 import os
 import json
-import warnings
-import time
+import datetime
+import requests
+import pandas as pd
+from tradingview_screener import Query, Column
 
-warnings.filterwarnings('ignore')
-
-# --- Regime Parameters ---
-QUANT_DAYS = 15              
-MIN_RSI = 47.0               
-MAX_RALLY_PCT = 15.0         
-MIN_VOLUME_MULTIPLIER = 1.3  
-EMA_PROXIMITY_PCT = 0.05     
-MIN_PRICE_FILTER = 50.0      
-
-def get_all_nse_tickers():
-    """Fetches Nifty 500 + Microcap 250 lists."""
-    print("Fetching Ticker Universe...")
-    urls = [
-        "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
-        "https://archives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv"
-    ]
-    tickers = set()
-    for url in urls:
-        try:
-            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            df = pd.read_csv(io.StringIO(res.text))
-            df.columns = df.columns.str.strip()
-            for symbol in df['Symbol']:
-                tickers.add(f"{symbol}.NS")
-        except:
-            pass
-    # Fallback just in case NSE archives are blocked
-    if not tickers:
-        tickers = {"RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS"}
-    return list(tickers)
+# --- Quantitative Regime Parameters ---
+MIN_PRICE_FILTER = 50.0
+MIN_RSI = 47.0
+MAX_RSI = 78.0
+MIN_VOL_SPIKE = 1.3
+EMA_PROXIMITY_PCT = 0.05
 
 def calculate_ai_score(rsi, vol_mult, dist_52w, pe):
-    score = 50 
-    if rsi > 60: score += 10
-    elif rsi > 50: score += 5
-    if vol_mult > 3.0: score += 20
-    elif vol_mult > 2.0: score += 15
-    elif vol_mult > 1.5: score += 5
-    if -5.0 <= dist_52w <= 0: score += 15
-    elif -15.0 <= dist_52w < -5.0: score += 10
+    score = 50
+    if rsi >= 60: score += 15
+    elif rsi >= 52: score += 10
     
-    # Fundamental Buffer
-    if pe != "N/A":
-        if 0 < pe < 30: score += 5
-        elif pe > 80: score -= 10
+    if vol_mult >= 2.5: score += 20
+    elif vol_mult >= 1.8: score += 15
+    elif vol_mult >= 1.3: score += 10
+    
+    if -5.0 <= dist_52w <= 0: score += 15
+    elif -12.0 <= dist_52w < -5.0: score += 10
+    
+    if isinstance(pe, (int, float)) and 0 < pe < 35:
+        score += 5
         
-    score = min(max(score, 0), 100) 
-    if score >= 75: decision = "🔥 STRONG BUY"
-    elif score >= 60: decision = "✅ BUY"
+    score = min(max(score, 0), 100)
+    if score >= 80: decision = "🔥 STRONG BUY"
+    elif score >= 65: decision = "✅ BUY"
     else: decision = "👀 WATCH"
     return score, decision
 
-def execute_smart_scan(tickers):
-    today = datetime.date.today()
+def fetch_nse_market_data():
+    """Pulls live technicals & fundamentals for top 750 NSE stocks in 1 request (Zero 429 blocks)."""
+    print("Querying Institutional Screener Engine for top 750 NSE stocks...")
+    q = (Query()
+         .set_markets('india')
+         .select(
+             'name', 'sector', 'close', 'volume', 'average_volume_30d_calc',
+             'RSI', 'EMA20', 'EMA50', 'ATR', 'price_52_week_high',
+             'price_earnings_ttm', 'price_book_fq', 'debt_to_equity', 'market_cap_basic'
+         )
+         .where(
+             Column('exchange') == 'NSE',
+             Column('close') >= MIN_PRICE_FILTER,
+             Column('average_volume_30d_calc') > 50000
+         )
+         .order_by('market_cap_basic', ascending=False)
+         .limit(750))
     
-    try:
-        nifty = yf.download("^NSEI", period="1y", progress=False)['Close']
-        nifty_1m_ret = (nifty.iloc[-1] - nifty.iloc[-21]) / nifty.iloc[-21]
-    except: 
-        nifty_1m_ret = 0.0
+    total_count, df = q.get_scanner_data()
+    print(f"Successfully downloaded {len(df)} liquid NSE stocks.")
+    return df
 
-    print(f"Phase 1: Downloading raw price data for {len(tickers)} stocks...")
-    
-    # Split into two batches to guarantee no download timeouts
-    midpoint = len(tickers) // 2
-    batch1, batch2 = tickers[:midpoint], tickers[midpoint:]
-    
-    df1 = yf.download(batch1, period="1y", progress=False, group_by="ticker", threads=True)
-    df2 = yf.download(batch2, period="1y", progress=False, group_by="ticker", threads=True)
-    
-    # Combine the downloaded data
-    data = pd.concat([df1, df2], axis=1)
+def process_scanner_data(df):
+    today_str = str(datetime.date.today())
+    quant_setups = []
+    library_list = []
 
-    print("Phase 2: Running local quantitative math (0 API calls)...")
-    technically_primed_tickers = []
-    quant_metrics = {}
-
-    for ticker in tickers:
+    for _, row in df.iterrows():
         try:
-            if isinstance(data.columns, pd.MultiIndex):
-                if ticker not in data.columns.get_level_values(0): continue
-                c = data[ticker]['Close'].dropna()
-                v = data[ticker]['Volume'].dropna()
-                h = data[ticker]['High'].dropna()
-                l = data[ticker]['Low'].dropna()
-            else:
-                continue # Safety skip if data structure fails
+            ticker = str(row.get('name', '')).strip()
+            sector = str(row.get('sector') or 'Unknown')
+            cmp = round(float(row['close']), 2)
+            
+            vol = float(row.get('volume') or 0)
+            avg_vol = float(row.get('average_volume_30d_calc') or 1)
+            vol_mult = round(vol / avg_vol, 2) if avg_vol > 0 else 0.0
+            
+            rsi = round(float(row.get('RSI') or 0), 2)
+            ema20 = float(row.get('EMA20') or cmp)
+            ema50 = float(row.get('EMA50') or cmp)
+            atr = float(row.get('ATR') or (cmp * 0.02))
+            high_52w = float(row.get('price_52_week_high') or cmp)
+            
+            dist_52w = round(((cmp - high_52w) / high_52w) * 100, 2) if high_52w > 0 else 0.0
+            
+            pe = round(float(row['price_earnings_ttm']), 2) if pd.notna(row.get('price_earnings_ttm')) else "N/A"
+            pb = round(float(row['price_book_fq']), 2) if pd.notna(row.get('price_book_fq')) else "N/A"
+            debt_eq = round(float(row['debt_to_equity']), 2) if pd.notna(row.get('debt_to_equity')) else "N/A"
+
+            # Add top 250 stocks to Market Library tab regardless of filters
+            if len(library_list) < 250:
+                library_list.append({
+                    'Scan Date': today_str, 'Ticker': ticker, 'Sector': sector,
+                    'CMP': cmp, 'RSI': rsi, 'Vol Spike': f"{vol_mult:.1f}x",
+                    'PE Ratio': pe, 'P/B Ratio': pb, 'Debt/Equity': debt_eq,
+                    '52W High Dist (%)': dist_52w
+                })
+
+            # --- Strict Quant-Fundy Momentum Filters ---
+            if not (MIN_RSI <= rsi <= MAX_RSI):
+                continue
+            if vol_mult < MIN_VOL_SPIKE:
+                continue
                 
-            if len(c) < 50: continue
-            
-            cmp = round(c.iloc[-1], 2)
-            if cmp < MIN_PRICE_FILTER: continue
-
-            ema20 = c.ewm(span=20, adjust=False).mean()
-            ema50 = c.ewm(span=50, adjust=False).mean()
-            vol_sma20 = v.rolling(20).mean()
-            
-            delta = c.diff()
-            gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-            loss = -1 * delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
-            rsi = 100 - (100 / (1 + (gain / loss)))
-            
-            prev_c = c.shift(1)
-            tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-            atr = tr.rolling(14).mean()
-            
-            latest_rsi, latest_atr = rsi.iloc[-1], atr.iloc[-1]
-            latest_ema20, latest_ema50 = ema20.iloc[-1], ema50.iloc[-1]
-            
-            prev_month = c.iloc[-21] if len(c) > 21 else c.iloc[0]
-            monthly_return = ((cmp - prev_month) / prev_month) * 100
-            
-            recent_vol = v.iloc[-5:]
-            avg_vol = vol_sma20.iloc[-5:].mean()
-            vol_mult = recent_vol.max() / avg_vol if avg_vol > 0 else 0
-            
-            dist_52w = ((cmp - h.max()) / h.max()) * 100
-            
-            # THE GATES: Only pass if momentum is perfect
-            if (MIN_RSI <= latest_rsi <= 78) and (monthly_return <= MAX_RALLY_PCT) and (vol_mult >= MIN_VOLUME_MULTIPLIER):
-                if (abs(cmp - latest_ema20) / latest_ema20 <= EMA_PROXIMITY_PCT or abs(cmp - latest_ema50) / latest_ema50 <= EMA_PROXIMITY_PCT):
-                    if ((cmp - c.iloc[-21]) / c.iloc[-21]) >= nifty_1m_ret:
-                        
-                        # Save metrics for Phase 3
-                        technically_primed_tickers.append(ticker)
-                        quant_metrics[ticker] = {
-                            'CMP': cmp, 'RSI': latest_rsi, 'ATR': latest_atr, 
-                            'Vol Mult': vol_mult, 'Dist 52W': dist_52w
-                        }
-        except:
-            continue
-
-    print(f"Phase 3: Found {len(technically_primed_tickers)} momentum breakouts.")
-    print("Fetching Earnings Dates & Fundamentals ONLY for these winners...")
-    
-    final_setups = []
-    
-    # We only ping Yahoo for the tiny list of winners. Unblockable.
-    for ticker in technically_primed_tickers:
-        time.sleep(0.5) # Gentle pause
-        try:
-            stock = yf.Ticker(ticker)
-            
-            # Get Dates
-            e_date_str, days_to_earn = "Unknown", "N/A"
-            try:
-                cal = stock.calendar
-                if isinstance(cal, dict) and 'Earnings Date' in cal:
-                    e_date = cal['Earnings Date'][0].date()
-                    if (e_date - today).days >= 0:
-                        e_date_str, days_to_earn = str(e_date), (e_date - today).days
-                elif hasattr(cal, 'empty') and not cal.empty and 'Earnings Date' in cal.index:
-                    e_date = cal.loc['Earnings Date'][0].date()
-                    if (e_date - today).days >= 0:
-                        e_date_str, days_to_earn = str(e_date), (e_date - today).days
-            except: pass
-
-            # Ensure it fits the 15-day window (or is unknown)
-            if days_to_earn != "N/A" and days_to_earn > QUANT_DAYS:
+            near_ema20 = abs(cmp - ema20) / ema20 <= EMA_PROXIMITY_PCT if ema20 > 0 else False
+            near_ema50 = abs(cmp - ema50) / ema50 <= EMA_PROXIMITY_PCT if ema50 > 0 else False
+            if not (near_ema20 or near_ema50):
                 continue
 
-            # Get Fundamentals
-            try:
-                info = stock.info
-                sector = info.get('sector', 'Unknown')
-                pe = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else "N/A"
-                pb = round(info.get('priceToBook', 0), 2) if info.get('priceToBook') else "N/A"
-                debt_eq = round(info.get('debtToEquity', 0), 2) if info.get('debtToEquity') else "N/A"
-            except:
-                sector, pe, pb, debt_eq = 'Unknown', "N/A", "N/A", "N/A"
-
-            # Retrieve saved math
-            metrics = quant_metrics[ticker]
-            cmp, atr = metrics['CMP'], metrics['ATR']
+            ai_score, decision = calculate_ai_score(rsi, vol_mult, dist_52w, pe)
             
-            ai_score, decision = calculate_ai_score(metrics['RSI'], metrics['Vol Mult'], metrics['Dist 52W'], pe)
+            buy_low = round(min(cmp, ema20), 2)
+            buy_zone = f"₹{buy_low} - ₹{cmp}"
+            target = round(cmp + max(cmp * 0.06, 2.5 * atr), 2)
+            stop_loss = round(cmp - (1.5 * atr), 2)
 
-            setup = {
-                'Scan Date': str(today),
+            quant_setups.append({
+                'Scan Date': today_str,
                 'Decision': decision,
                 'AI Score': ai_score,
-                'Ticker': ticker.replace('.NS', ''),
+                'Ticker': ticker,
                 'Sector': sector,
-                'Earnings Date': e_date_str,
-                'Days': days_to_earn,
                 'CMP': cmp,
-                'Target': round(cmp + max((cmp * 0.06), (2.5 * atr)), 2),
-                'Stop Loss': round(cmp - (1.5 * atr), 2),
-                'RSI': round(metrics['RSI'], 2),
-                'Vol Spike': f"{metrics['Vol Mult']:.1f}x",
+                'Buy Zone': buy_zone,
+                'Target': target,
+                'Stop Loss': stop_loss,
+                'RSI': rsi,
+                'Vol Spike': f"{vol_mult:.1f}x",
                 'PE Ratio': pe,
                 'P/B Ratio': pb,
                 'Debt/Equity': debt_eq,
-                '52W High Dist (%)': round(metrics['Dist 52W'], 2)
-            }
-            final_setups.append(setup)
-        except Exception as e:
-            print(f"Failed to fetch info for {ticker}: {e}")
+                '52W High Dist (%)': dist_52w
+            })
+        except Exception:
             continue
 
-    df = pd.DataFrame(final_setups)
-    if not df.empty:
-        df = df.sort_values(by='AI Score', ascending=False)
-    return df
+    quant_df = pd.DataFrame(quant_setups)
+    if not quant_df.empty:
+        quant_df = quant_df.sort_values(by=['AI Score', 'RSI'], ascending=[False, False])
+    else:
+        # Heartbeat row so the sheet NEVER stays blank
+        quant_df = pd.DataFrame([{
+            'Scan Date': today_str, 'Decision': '⏸️ NO MATCH TODAY', 'AI Score': 0,
+            'Ticker': 'SYSTEM_ACTIVE', 'Sector': 'Market Scan Complete', 'CMP': 0,
+            'Buy Zone': 'N/A', 'Target': 0, 'Stop Loss': 0, 'RSI': 0,
+            'Vol Spike': '0.0x', 'PE Ratio': 'N/A', 'P/B Ratio': 'N/A',
+            'Debt/Equity': 'N/A', '52W High Dist (%)': 0
+        }])
 
-def push_results(dataframe):
+    return quant_df, library_list
+
+def push_notifications(quant_df, library_list):
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     chat_id = os.getenv('TELEGRAM_CHAT_ID')
     webhook = os.getenv('WEBHOOK_URL')
 
-    if dataframe.empty:
-        print("No setups passed the final phase today.")
-        return
-
-    # 1. Telegram
-    if token and chat_id:
-        tg_df = dataframe[['Decision', 'Ticker', 'CMP', 'Target', 'Stop Loss']]
-        msg = "🧠 *QUANT PREDICTOR ALERT*\n\n```text\n" + tg_df.to_string(index=False) + "\n```"
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "MarkdownV2"})
-        print("Telegram Sent.")
-
-    # 2. Google Sheets
+    # 1. Push to Google Sheets with Verbose Verification
     if webhook:
-        payload = {"type": "quant", "chunk_index": 1, "data": dataframe.to_dict(orient='records')}
-        res = requests.post(webhook, json=payload, headers={'Content-Type': 'application/json'})
-        if res.status_code == 200:
-            print("Google Sheet Updated.")
-        else:
-            print(f"Sheet Error: {res.status_code}")
+        payload = {
+            "clear_main": False,
+            "quant": quant_df.to_dict(orient='records'),
+            "library": library_list
+        }
+        try:
+            res = requests.post(webhook, json=payload, headers={'Content-Type': 'application/json'}, timeout=30)
+            print(f"Google Sheets Webhook Status: {res.status_code} | Response: {res.text[:200]}")
+        except Exception as e:
+            print(f"Google Sheets Webhook Failed: {e}")
+    else:
+        print("ERROR: WEBHOOK_URL secret is empty!")
+
+    # 2. Push to Telegram (Using safe HTML mode)
+    if token and chat_id:
+        top_df = quant_df[['Decision', 'Ticker', 'CMP', 'Target', 'Stop Loss']].head(15)
+        msg = f"<b>🧠 QUANT-FUNDY SCANNER REPORT ({len(quant_df)} Setups)</b>\n\n<pre>{top_df.to_string(index=False)}</pre>"
+        try:
+            tg_res = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+                timeout=15
+            )
+            print(f"Telegram Status: {tg_res.status_code} | Response: {tg_res.text[:200]}")
+        except Exception as e:
+            print(f"Telegram Failed: {e}")
+    else:
+        print("ERROR: TELEGRAM secrets are missing!")
 
 if __name__ == "__main__":
-    nse_watchlist = get_all_nse_tickers()
-    if nse_watchlist:
-        final_df = execute_smart_scan(nse_watchlist)
-        push_results(final_df)
+    raw_df = fetch_nse_market_data()
+    quant_df, library_list = process_scanner_data(raw_df)
+    print(quant_df.head(10).to_string(index=False))
+    push_notifications(quant_df, library_list)
