@@ -125,7 +125,6 @@ def execute_slow_scan(tickers):
                 if len(df) < 50: 
                     continue
                 
-                # Squeeze to ensure single-dimension series
                 c = df['Close'].squeeze() if isinstance(df['Close'], pd.DataFrame) else df['Close']
                 v = df['Volume'].squeeze() if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
                 h = df['High'].squeeze() if isinstance(df['High'], pd.DataFrame) else df['High']
@@ -210,4 +209,36 @@ def execute_slow_scan(tickers):
     return cal_df, quant_df
 
 def send_telegram_alert(dataframe):
-    token, chat_id = os.getenv('TELE
+    token, chat_id = os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID')
+    if not token or not chat_id or dataframe.empty: return
+    tg_df = dataframe[['Decision', 'Ticker', 'CMP', 'Target', 'Stop Loss']]
+    message = "🧠 *QUANT PREDICTOR ALERT*\n\n```text\n" + tg_df.to_string(index=False) + "\n```"
+    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": message, "parse_mode": "MarkdownV2"})
+
+def push_to_webhook(data_type, dataframe):
+    url = os.getenv('WEBHOOK_URL')
+    if not url or dataframe.empty: return
+    try:
+        chunk_size = 200 
+        records = dataframe.to_dict(orient='records')
+        for idx, i in enumerate(range(0, len(records), chunk_size)):
+            chunk = records[i:i + chunk_size]
+            payload = {"type": data_type, "chunk_index": idx, "data": chunk}
+            requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
+            time.sleep(1.5) 
+    except Exception as e:
+        print(f"Webhook error ({data_type}): {e}")
+
+if __name__ == "__main__":
+    nse_watchlist = get_all_nse_tickers()
+    if nse_watchlist:
+        cal_df, quant_df = execute_slow_scan(nse_watchlist)
+        if not cal_df.empty:
+            print(f"Found {len(cal_df)} stocks. Pushing to Library...")
+            push_to_webhook("calendar", cal_df)
+        if not quant_df.empty:
+            print(f"Found {len(quant_df)} setups. Pushing to Predictor & Telegram...")
+            push_to_webhook("quant", quant_df)
+            send_telegram_alert(quant_df)
+        else:
+            print("No actionable Quant-Fundy setups found today.")
