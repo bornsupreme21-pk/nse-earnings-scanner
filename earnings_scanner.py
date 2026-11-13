@@ -2,13 +2,14 @@ import os
 import datetime
 import requests
 import pandas as pd
+import yfinance as yf
 from tradingview_screener import Query, Column
 
-# --- Core Low-Phase Pre-Catalyst Parameters ---
+# --- Core V7.0 "Giant Killer" Parameters ---
 MIN_PRICE_FILTER = 50.0
-MIN_RSI = 45.0
-MAX_RSI = 72.0           # Lowered from 78 so we NEVER buy overbought tops!
-MAX_1W_CHASE_PCT = 8.5   # Reject stocks that have already spiked >8.5% this week
+MIN_RSI = 44.0
+MAX_RSI = 70.0           # Strictly buy before overbought euphoria
+MAX_1W_CHASE_PCT = 7.5   # Never chase stocks already up >7.5% this week
 LIBRARY_MAX_DAYS = 35
 
 NSE_HEADERS = {
@@ -32,7 +33,7 @@ def first_valid_float(row, keys, default=None):
     return default
 
 def fetch_nse_corporate_catalysts():
-    """Fetches upcoming NSE Board Meetings (Results, Acquisitions, Fundraising, Dividends) if reachable."""
+    """Scrapes NSE Official Board Meetings for Results, M&A, Partnerships, Buybacks, Dividends."""
     catalysts = {}
     try:
         session = requests.Session()
@@ -48,7 +49,7 @@ def fetch_nse_corporate_catalysts():
                         dt = datetime.datetime.strptime(date_str, "%d-%b-%Y").date()
                         tag = "📅 Board Meeting"
                         if "Result" in purpose: tag = "📊 Qtr Results BM"
-                        elif any(k in purpose.lower() for k in ["acqui", "amalga", "merger", "scheme"]): tag = "🤝 M&A / Restructuring"
+                        elif any(k in purpose.lower() for k in ["acqui", "amalga", "merger", "scheme", "joint"]): tag = "🤝 M&A / Partnership"
                         elif any(k in purpose.lower() for k in ["fund", "preferential", "qip", "rights"]): tag = "💰 Capital Raise BM"
                         elif any(k in purpose.lower() for k in ["dividend", "buyback", "bonus", "split"]): tag = "🎁 Corporate Action BM"
                         catalysts[sym] = (dt, tag)
@@ -59,7 +60,6 @@ def fetch_nse_corporate_catalysts():
     return catalysts
 
 def parse_earnings_date(ts_val, ticker, nse_catalysts, today):
-    # Check NSE Official Board Meeting first
     if ticker in nse_catalysts:
         dt, tag = nse_catalysts[ticker]
         days = (dt - today).days
@@ -75,124 +75,124 @@ def parse_earnings_date(ts_val, ticker, nse_catalysts, today):
     except Exception:
         return "Unknown", ""
 
-def evaluate_low_phase_setup(
+def enrich_top_candidates_with_yfinance(records):
+    """Enriches top candidates with Yahoo Finance forwardEps & analyst target prices."""
+    for rec in records[:25]:
+        if rec['Est Next EPS Gr (%)'] == "" or rec['Earnings Date'] == "Unknown":
+            try:
+                tk = yf.Ticker(f"{rec['Ticker']}.NS")
+                info = tk.info or {}
+                fwd_eps = safe_float(info.get('forwardEps'))
+                trl_eps = safe_float(info.get('trailingEps'))
+                if rec['Est Next EPS Gr (%)'] == "" and fwd_eps and trl_eps and trl_eps > 0:
+                    rec['Est Next EPS Gr (%)'] = round(((fwd_eps - trl_eps) / abs(trl_eps)) * 100, 2)
+                tgt_mean = safe_float(info.get('targetMeanPrice'))
+                if tgt_mean and tgt_mean > rec['Min Target']:
+                    rec['Max Target'] = round(max(rec['Max Target'], min(tgt_mean, rec['CMP'] * 1.25)), 2)
+                    rec['Max Growth (%)'] = round(((rec['Max Target'] - rec['CMP']) / rec['CMP']) * 100, 2)
+            except Exception:
+                continue
+
+def evaluate_giant_killer_score(
     sector, rsi, vol_mult, dist_52w, chg_1d, chg_1w, chg_1m,
-    est_eps_gr, qtr_rev_gr, qtr_eps_gr, op_margin, roe, pe, pb, debt_eq,
-    adx, days_left, cmp, ema20, ema50, atr
+    eff_eps_gr, qtr_rev_gr, qtr_eps_gr, op_margin, roe, pe, pb, debt_eq,
+    adx, days_left, cmp, ema20, ema50
 ):
-    """
-    Scores stocks specifically for LOW-PHASE ACCUMULATION before an upcoming event/result
-    where 5%+ minimum upside is achievable without chasing overextended highs.
-    """
     score = 0
     is_financial = any(w in sector.lower() for w in ['finance', 'bank', 'insurance', 'investment'])
 
-    # 1. Low-Phase Base Proximity (Max 22 pts) - Rewards buying near support, NOT after a huge rally!
+    # 1. Low-Phase Base Proximity (Max 25 pts) - Highest weight on buying at the quiet support floor
     dist_ema20_pct = ((cmp - ema20) / ema20) * 100 if ema20 > 0 else 0
-    if -2.5 <= dist_ema20_pct <= 2.5 and -3.0 <= chg_1w <= 4.0:
-        score += 22  # Perfect quiet coiling at 20-EMA support base
-    elif -4.0 <= dist_ema20_pct <= 4.5 and chg_1w <= 6.5:
-        score += 16  # Healthy accumulation zone
-    elif dist_ema20_pct <= 6.0:
-        score += 9
+    if -2.5 <= dist_ema20_pct <= 2.2 and -3.5 <= chg_1w <= 3.5:
+        score += 25  # Coiling tightly at 20-EMA floor
+    elif -4.0 <= dist_ema20_pct <= 4.0 and chg_1w <= 6.0:
+        score += 18
+    elif dist_ema20_pct <= 5.5:
+        score += 10
 
-    # 2. Optimal Pre-Breakout RSI & Institutional Volume Absorption (Max 20 pts)
-    if 48 <= rsi <= 63:
-        score += 10  # Plenty of room to run before hitting overbought 70+
-    elif 63 < rsi <= 70:
-        score += 6
-    elif 45 <= rsi < 48:
-        score += 5
+    # 2. Pre-Breakout RSI & Institutional Accumulation Volume (Max 18 pts)
+    if 46 <= rsi <= 62: score += 10
+    elif 62 < rsi <= 68: score += 6
+    elif 44 <= rsi < 46: score += 5
 
-    if vol_mult >= 2.0: score += 10
-    elif vol_mult >= 1.4: score += 8
-    elif vol_mult >= 1.1: score += 5
+    if vol_mult >= 2.0: score += 8
+    elif vol_mult >= 1.35: score += 6
+    elif vol_mult >= 1.05: score += 4
 
-    # 3. Forward Earnings Forecast & Recent Fundamental Acceleration (Max 33 pts)
+    # 3. Consensus Forward EPS / Profit Acceleration (Max 32 pts)
     missing_fundy = 0
-    if est_eps_gr is not None:
-        if est_eps_gr >= 20: score += 13
-        elif est_eps_gr >= 10: score += 10
-        elif est_eps_gr > 0: score += 6
+    if eff_eps_gr is not None:
+        if eff_eps_gr >= 30: score += 18
+        elif eff_eps_gr >= 18: score += 14
+        elif eff_eps_gr >= 10: score += 9
+        elif eff_eps_gr > 0: score += 5
     else:
-        # Use historical momentum if analyst consensus isn't covered
-        if (qtr_eps_gr or 0) >= 25: score += 10
-        elif (qtr_eps_gr or 0) >= 12: score += 6
+        missing_fundy += 1
 
     if qtr_rev_gr is not None:
-        if qtr_rev_gr >= 20: score += 10
-        elif qtr_rev_gr >= 10: score += 7
-        elif qtr_rev_gr > 0: score += 4
+        if qtr_rev_gr >= 20: score += 14
+        elif qtr_rev_gr >= 12: score += 10
+        elif qtr_rev_gr >= 5: score += 6
     else:
         missing_fundy += 1
 
-    if qtr_eps_gr is not None:
-        if qtr_eps_gr >= 25: score += 10
-        elif qtr_eps_gr >= 12: score += 7
-        elif qtr_eps_gr > 0: score += 4
-    else:
-        missing_fundy += 1
-
-    # 4. Sector-Aware Quality & Valuation Safety (Max 15 pts)
+    # 4. Sector-Aware Balance Sheet & ROE Power (Max 15 pts)
     if is_financial:
         if (roe or 0) >= 15: score += 9
         elif (roe or 0) >= 10: score += 5
         else: missing_fundy += 1
-        if pb is not None and 0 < pb <= 4.0: score += 6
+        if pb is not None and 0 < pb <= 3.8: score += 6
         elif pe is not None and 0 < pe <= 22: score += 4
     else:
         if (op_margin or 0) >= 16: score += 6
         elif (op_margin or 0) >= 10: score += 4
         if (roe or 0) >= 16: score += 6
-        elif (roe or 0) >= 10: score += 4
+        elif (roe or 0) >= 11: score += 4
         else: missing_fundy += 1
         if debt_eq is not None and debt_eq <= 0.6: score += 3
 
-    # 5. Event / Earnings Catalyst Horizon (Max 10 pts)
+    # 5. Pre-Catalyst Window (Max 10 pts)
     regime = "💎 LOW-PHASE BASE BUY"
     if isinstance(days_left, int):
         if 0 <= days_left <= 1:
             regime = "⛔ BINARY EVENT (Do Not Enter)"
-            score -= 20
+            score -= 25
         elif 2 <= days_left <= 15:
             score += 10
-            if dist_ema20_pct <= 2.0:
-                regime = "💎 PRE-EVENT LOW-PHASE BUY (Exit T-1)"
-            else:
-                regime = "🎯 PRE-ER ANTICIPATION (Exit T-1)"
+            regime = "💎 PRE-EVENT LOW-PHASE BUY (Exit T-1)" if dist_ema20_pct <= 2.2 else "🎯 PRE-ER RUNUP (Exit T-1)"
         elif 16 <= days_left <= 35:
-            score += 8
+            score += 9
             regime = "⏳ EARLY PRE-RESULT ACCUMULATION"
-        elif 65 <= days_left <= 92 and (qtr_eps_gr or 0) >= 20 and dist_ema20_pct <= 3.5:
+        elif 65 <= days_left <= 92 and (qtr_eps_gr or 0) >= 20 and dist_ema20_pct <= 3.0:
             score += 7
             regime = "⚡ POST-RESULT PULLBACK BUY"
         else:
-            score += 3
+            score += 4
     else:
-        if (est_eps_gr or 0) >= 15 and dist_ema20_pct <= 2.5:
-            score += 6
-            regime = "🔮 ESTIMATE BEAT ACCUMULATION"
+        if (eff_eps_gr or 0) >= 20 and dist_ema20_pct <= 2.5:
+            score += 7
+            regime = "🔮 CONSENSUS BEAT ACCUMULATION"
 
     if missing_fundy >= 2:
-        score = min(score, 73)
+        score = min(score, 72)
 
     score = min(max(int(round(score)), 0), 100)
 
     if "BINARY EVENT" in regime:
         decision = "⛔ AVOID EVENT GAP"
     elif score >= 84:
-        decision = "🚀 BLAST READY (Buy Low)"
-    elif score >= 74:
-        decision = "🔥 STRONG BUY"
-    elif score >= 64:
-        decision = "✅ ACCUMULATE"
+        decision = "🚀 GIANT-KILLER BUY"
+    elif score >= 75:
+        decision = "🔥 STRONG ACCUMULATE"
+    elif score >= 65:
+        decision = "✅ BUY IN ZONE"
     else:
         decision = "👀 WATCH"
 
     return score, decision, regime
 
 def fetch_nse_market_data():
-    print("Querying Institutional Screener + Consensus Estimates for 750 NSE stocks...")
+    print("Querying Institutional Screener for 750 NSE stocks...")
     cols = [
         'name', 'sector', 'close', 'high', 'low', 'change', 'Perf.W', 'Perf.1M',
         'volume', 'average_volume_30d_calc', 'relative_volume_10d_calc',
@@ -252,6 +252,7 @@ def process_scanner_data(df):
     quant_setups = []
     library_list = []
     price_map = {}
+    daily_changes = []
 
     for _, row in df.iterrows():
         try:
@@ -266,6 +267,7 @@ def process_scanner_data(df):
             price_map[ticker] = {"cmp": cmp, "high": day_high, "low": day_low}
 
             chg_1d = round(safe_float(row.get('change'), 0.0), 2)
+            daily_changes.append(chg_1d)
             prev_close = round(cmp / (1 + (chg_1d / 100.0)), 2) if chg_1d != -100 else cmp
             chg_1w = round(safe_float(row.get('Perf.W'), 0.0), 2)
             chg_1m = round(safe_float(row.get('Perf.1M'), 0.0), 2)
@@ -286,168 +288,15 @@ def process_scanner_data(df):
             low_52w = round(safe_float(row.get('price_52_week_low'), cmp), 2)
             dist_52w = round(((cmp - high_52w) / high_52w) * 100, 2) if high_52w > 0 else 0.0
 
-            # Forward Consensus EPS Surprise Calculation
+            qtr_rev_gr = safe_float(row.get('total_revenue_yoy_growth_fq'))
+            qtr_eps_gr = safe_float(row.get('earnings_per_share_diluted_yoy_growth_fq'))
+
+            # Consensus Forward EPS Growth with automatic Fallback to Trailing Qtr Profit Growth
             eps_forecast = safe_float(row.get('earnings_per_share_forecast_next_fq'))
             eps_last = safe_float(row.get('earnings_per_share_fq'))
             est_eps_gr = None
             if eps_forecast is not None and eps_last is not None and eps_last > 0:
                 est_eps_gr = round(((eps_forecast - eps_last) / abs(eps_last)) * 100, 2)
+            eff_eps_gr = est_eps_gr if est_eps_gr is not None else qtr_eps_gr
 
-            qtr_rev_gr = safe_float(row.get('total_revenue_yoy_growth_fq'))
-            qtr_eps_gr = safe_float(row.get('earnings_per_share_diluted_yoy_growth_fq'))
-            op_margin = first_valid_float(row, ['operating_margin_ttm', 'operating_margin_fq'])
-            roe = first_valid_float(row, ['return_on_equity', 'return_on_equity_fq'])
-
-            pe = safe_float(row.get('price_earnings_ttm'))
-            pb = first_valid_float(row, ['price_book_fq', 'price_book_ratio'])
-            debt_eq = first_valid_float(row, ['debt_to_equity', 'debt_to_equity_fq'])
-            mcap_cr = round(safe_float(row.get('market_cap_basic'), 0.0) / 10000000, 2)
-            analyst_target = safe_float(row.get('price_target_1y'))
-
-            e_date_str, days_left = parse_earnings_date(row.get('earnings_release_next_date'), ticker, nse_catalysts, today)
-
-            ai_score, decision, regime = evaluate_low_phase_setup(
-                sector, rsi, vol_mult, dist_52w, chg_1d, chg_1w, chg_1m,
-                est_eps_gr, qtr_rev_gr, qtr_eps_gr, op_margin, roe, pe, pb, debt_eq,
-                adx, days_left, cmp, ema20, ema50, atr
-            )
-
-            # Buying Range at the Low Phase & Dual Target Brackets (Min 5.25% + Max Catalyst Upside)
-            support_anchor = min(cmp, max(ema20, cmp - 0.8 * atr))
-            buy_low = round(support_anchor - (0.4 * atr), 2)
-            buy_high = round(min(cmp, ema20 * 1.015), 2) if cmp > ema20 * 1.015 else cmp
-
-            min_target = round(cmp * 1.0525, 2)  # Guaranteed minimum >5% profit target
-            tech_max_target = round(cmp + max(cmp * 0.09, 3.0 * atr), 2)
-            if analyst_target and analyst_target > min_target:
-                max_target = round(min(analyst_target, cmp * 1.22), 2)
-                max_target = max(max_target, tech_max_target)
-            else:
-                max_target = tech_max_target
-
-            max_growth_pct = round(((max_target - cmp) / cmp) * 100, 2)
-            stop_loss = round(min(buy_low - 0.8 * atr, cmp * 0.965), 2)
-
-            record = {
-                'Scan Date': today_str,
-                'Regime': regime,
-                'Decision': decision,
-                'AI Score': ai_score,
-                'Ticker': ticker,
-                'Sector': sector,
-                'Earnings Date': e_date_str,
-                'Days Left': days_left,
-                'CMP': cmp,
-                'Prev Close': prev_close,
-                '1D Chg (%)': chg_1d,
-                '1W Chg (%)': chg_1w,
-                '1M Chg (%)': chg_1m,
-                'Buy Low': buy_low,
-                'Buy High': buy_high,
-                'Min Target': min_target,
-                'Max Target': max_target,
-                'Max Growth (%)': max_growth_pct,
-                'Stop Loss': stop_loss,
-                'RSI': rsi,
-                'RVOL': vol_mult,
-                'ADX': adx,
-                '1Y Beta': round(beta, 2) if beta is not None else "",
-                '52W High': high_52w,
-                '52W Low': low_52w,
-                '52W High Dist (%)': dist_52w,
-                'Est Next EPS Gr (%)': est_eps_gr if est_eps_gr is not None else "",
-                'Qtr Sales Gr (%)': round(qtr_rev_gr, 2) if qtr_rev_gr is not None else "",
-                'Qtr Profit Gr (%)': round(qtr_eps_gr, 2) if qtr_eps_gr is not None else "",
-                'Op Margin (%)': round(op_margin, 2) if op_margin is not None else "",
-                'ROE (%)': round(roe, 2) if roe is not None else "",
-                'PE Ratio': round(pe, 2) if pe is not None else "",
-                'P/B Ratio': round(pb, 2) if pb is not None else "",
-                'Debt/Equity': round(debt_eq, 2) if debt_eq is not None else "",
-                'MCap (Cr)': mcap_cr
-            }
-
-            # 1. 30-Day Earnings Library: Strictly 1 to 35 Days Out
-            if isinstance(days_left, int) and 1 <= days_left <= LIBRARY_MAX_DAYS:
-                library_list.append(record)
-
-            # 2. Strict Filter for "Quant-Fundy Logs" (Low-Phase Accumulation & Pre-Event Gems Only)
-            if isinstance(days_left, int) and days_left <= 1:
-                continue  # Never enter on Day 0 or Day 1
-            if not (MIN_RSI <= rsi <= MAX_RSI):
-                continue
-            if chg_1w > MAX_1W_CHASE_PCT:
-                continue  # Block stocks that have already run up >8.5% this week!
-
-            # Must be near 20-EMA or 50-EMA support base (within 4.5%) so we buy LOW
-            near_ema20 = -3.0 <= ((cmp - ema20) / ema20) * 100 <= 4.5 if ema20 > 0 else False
-            near_ema50 = -2.0 <= ((cmp - ema50) / ema50) * 100 <= 4.5 if ema50 > 0 else False
-            if not (near_ema20 or near_ema50):
-                continue
-
-            is_fin = any(w in sector.lower() for w in ['finance', 'bank', 'insurance', 'investment'])
-            if qtr_rev_gr is not None and qtr_rev_gr < 0:
-                continue
-            if qtr_eps_gr is not None and qtr_eps_gr < 0:
-                continue
-            if not is_fin and op_margin is not None and op_margin <= 5.0:
-                continue
-
-            if ai_score >= 74:
-                quant_setups.append(record)
-
-        except Exception:
-            continue
-
-    quant_df = pd.DataFrame(quant_setups)
-    if not quant_df.empty:
-        quant_df = quant_df.sort_values(by=['AI Score', 'Est Next EPS Gr (%)'], ascending=[False, False])
-
-    lib_df = pd.DataFrame(library_list)
-    if not lib_df.empty:
-        lib_df = lib_df.sort_values(by=['Days Left', 'AI Score'], ascending=[True, False])
-
-    return quant_df, lib_df.to_dict(orient='records'), price_map
-
-def push_notifications(quant_df, library_list, price_map):
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    chat_id = os.getenv('TELEGRAM_CHAT_ID')
-    webhook = os.getenv('WEBHOOK_URL')
-    today_str = str(datetime.date.today())
-
-    if webhook:
-        payload = {
-            "reset_logs": False,
-            "scan_date": today_str,
-            "quant": quant_df.to_dict(orient='records') if not quant_df.empty else [],
-            "library": library_list,
-            "price_map": price_map
-        }
-        try:
-            res = requests.post(webhook, json=payload, headers={'Content-Type': 'application/json'}, timeout=45)
-            print(f"Google Sheets Webhook Status: {res.status_code} | Response: {res.text[:200]}")
-        except Exception as e:
-            print(f"Google Sheets Webhook Failed: {e}")
-
-    if token and chat_id and not quant_df.empty:
-        top_df = quant_df[['Ticker', 'Days Left', 'CMP', 'Buy Low', 'Min Target', 'Max Growth (%)']].head(12)
-        msg = (
-            f"<b>💎 V6.0 LOW-PHASE PRE-EVENT GEMS ({len(quant_df)} Setups)</b>\n"
-            f"<i>Filtered for quiet base accumulation before results/events (Min +5.25% Target)</i>\n\n"
-            f"<pre>{top_df.to_string(index=False)}</pre>"
-        )
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
-                timeout=15
-            )
-        except Exception as e:
-            print(f"Telegram error: {e}")
-
-if __name__ == "__main__":
-    raw_df = fetch_nse_market_data()
-    quant_df, library_list, price_map = process_scanner_data(raw_df)
-    print(f"Low-Phase Pre-Event Gems Found: {len(quant_df)} | 30-Day Catalysts: {len(library_list)}")
-    if not quant_df.empty:
-        print(quant_df[['Regime', 'AI Score', 'Ticker', 'Days Left', 'CMP', 'Buy Low', 'Min Target', 'Max Growth (%)']].head(12).to_string(index=False))
-    push_notifications(quant_df, library_list, price_map)
+            op_margin =
