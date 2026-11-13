@@ -5,10 +5,10 @@ import pandas as pd
 from tradingview_screener import Query, Column
 
 MIN_PRICE_FILTER = 50.0
-MIN_RSI = 45.0
-MAX_RSI = 72.0
-MAX_1W_CHASE_PCT = 8.5
-LIBRARY_MAX_DAYS = 35
+MIN_RSI = 46.0
+MAX_RSI = 70.0
+MAX_1W_CHASE_PCT = 7.5
+LIBRARY_MAX_DAYS = 45
 
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -63,69 +63,108 @@ def parse_earnings_date(ts_val, ticker, nse_cat, today):
     except Exception:
         return "Unknown", ""
 
-def evaluate_low_phase(sector, rsi, rvol, chg_1w, est_eps_gr, rev_gr, eps_gr, op_m, roe, pe, pb, de, days_left, cmp, ema20):
+def evaluate_advance_motion(
+    sector, rsi, rvol, chg_1w, chg_1m, est_eps_gr, rev_gr, eps_gr,
+    op_m_fq, op_m_ttm, roe, pe, pb, de, days_left, cmp, ema20, ema50, atr
+):
+    """
+    V7.0 Advance Motion Detector:
+    Identifies stealth institutional accumulation AT THE LOW BASE before results/events,
+    filtering for Margin Expansion + Valuation Headroom so the stock rewards AFTER the result!
+    """
     score = 0
     is_fin = any(w in sector.lower() for w in ['finance', 'bank', 'insurance', 'investment'])
     dist_ema20 = ((cmp - ema20) / ema20) * 100 if ema20 > 0 else 0
+    atr_pct = (atr / cmp) * 100 if cmp > 0 else 3.0
 
-    if -2.5 <= dist_ema20 <= 2.5 and -3.0 <= chg_1w <= 4.0: score += 22
-    elif -4.0 <= dist_ema20 <= 4.5 and chg_1w <= 6.5: score += 16
-    elif dist_ema20 <= 6.0: score += 9
+    # 1. Stealth Motion & Low-Phase Volatility Coil (Max 24 pts)
+    if -2.0 <= dist_ema20 <= 2.5 and -2.5 <= chg_1w <= 3.5:
+        score += 16  # Tight base coiling right on 20-EMA support
+    elif -3.5 <= dist_ema20 <= 4.0 and chg_1w <= 5.5:
+        score += 12
+    elif dist_ema20 <= 5.5:
+        score += 6
 
-    if 48 <= rsi <= 63: score += 10
-    elif 63 < rsi <= 70: score += 6
-    elif 45 <= rsi < 48: score += 5
+    if ema20 >= ema50 * 0.995:
+        score += 4  # Structural uptrend alignment (Golden Base)
+    if atr_pct <= 3.2:
+        score += 4  # Volatility compression (Spring loaded before catalyst)
 
-    if rvol >= 2.0: score += 10
-    elif rvol >= 1.4: score += 8
-    elif rvol >= 1.1: score += 5
+    # 2. Institutional Volume Absorption & Un-Crowded RSI (Max 18 pts)
+    if 48 <= rsi <= 62: score += 9
+    elif 62 < rsi <= 68: score += 6
+    elif 46 <= rsi < 48: score += 5
 
+    if 1.25 <= rvol <= 2.8: score += 9  # Stealth accumulation without retail blow-off
+    elif rvol > 2.8: score += 7
+    elif rvol >= 1.05: score += 4
+
+    # 3. Post-Result Reward Engine: Consensus Beat + Margin Expansion (Max 33 pts)
     missing = 0
     if est_eps_gr is not None:
-        score += 13 if est_eps_gr >= 20 else (10 if est_eps_gr >= 10 else (6 if est_eps_gr > 0 else 0))
+        score += 13 if est_eps_gr >= 18 else (10 if est_eps_gr >= 8 else (5 if est_eps_gr > 0 else 0))
     else:
         score += 10 if (eps_gr or 0) >= 25 else (6 if (eps_gr or 0) >= 12 else 0)
 
     if rev_gr is not None:
-        score += 10 if rev_gr >= 20 else (7 if rev_gr >= 10 else (4 if rev_gr > 0 else 0))
+        score += 8 if rev_gr >= 18 else (6 if rev_gr >= 10 else (3 if rev_gr > 0 else 0))
     else: missing += 1
 
     if eps_gr is not None:
-        score += 10 if eps_gr >= 25 else (7 if eps_gr >= 12 else (4 if eps_gr > 0 else 0))
+        score += 8 if eps_gr >= 25 else (6 if eps_gr >= 12 else (3 if eps_gr > 0 else 0))
     else: missing += 1
 
+    # Margin Expansion Check (FQ vs TTM): Proves operating leverage is rising into the print
+    margin_expanding = (op_m_fq is not None and op_m_ttm is not None and op_m_fq >= op_m_ttm)
+    if margin_expanding:
+        score += 4
+
+    # 4. Valuation Headroom (Prevents "Priced-In / Sell-the-News" Crashes) (Max 15 pts)
+    op_m = op_m_fq if op_m_fq is not None else op_m_ttm
     if is_fin:
-        if (roe or 0) >= 15: score += 9
+        if (roe or 0) >= 15: score += 8
         elif (roe or 0) >= 10: score += 5
         else: missing += 1
-        if pb is not None and 0 < pb <= 4.0: score += 6
-        elif pe is not None and 0 < pe <= 22: score += 4
+        if pb is not None and 0 < pb <= 3.5: score += 7
+        elif pe is not None and 0 < pe <= 20: score += 5
     else:
-        if (op_m or 0) >= 16: score += 6
-        elif (op_m or 0) >= 10: score += 4
-        if (roe or 0) >= 16: score += 6
-        elif (roe or 0) >= 10: score += 4
+        if (op_m or 0) >= 15: score += 5
+        elif (op_m or 0) >= 10: score += 3
+        if (roe or 0) >= 16: score += 5
+        elif (roe or 0) >= 11: score += 3
         else: missing += 1
-        if de is not None and de <= 0.6: score += 3
+        # PEG / Valuation Headroom Check
+        if pe is not None and 0 < pe <= 32:
+            score += 5
+        elif pe is not None and 32 < pe <= 50 and (eps_gr or 0) >= 30:
+            score += 4
 
-    regime = "💎 LOW-PHASE BASE BUY"
+    # 5. Pre-Result / Post-Result Regime Routing (Max 10 pts)
+    val_safe = (pe is None or pe <= 48 or (eps_gr or 0) >= 35)
+    regime = "🕵️ STEALTH BASE ACCUMULATION"
     if isinstance(days_left, int):
         if 0 <= days_left <= 1:
             regime = "⛔ BINARY EVENT (Do Not Enter)"
-            score -= 20
-        elif 2 <= days_left <= 15:
+            score -= 25
+        elif 2 <= days_left <= 25:
             score += 10
-            regime = "💎 PRE-EVENT LOW-PHASE BUY (Exit T-1)" if dist_ema20 <= 2.0 else "🎯 PRE-ER ANTICIPATION (Exit T-1)"
-        elif 16 <= days_left <= 35:
+            if val_safe and (margin_expanding or (est_eps_gr or 0) >= 12) and dist_ema20 <= 3.0:
+                regime = "🕵️ STEALTH PRE-RESULT HOLD (Reward Post-ER)"
+            elif dist_ema20 <= 2.0:
+                regime = "💎 LOW-PHASE PRE-ER BUY (Book 50% T-1)"
+            else:
+                regime = "🎯 PRE-ER RUNUP (Exit T-1)"
+        elif 26 <= days_left <= 45:
             score += 8
-            regime = "⏳ EARLY PRE-RESULT ACCUMULATION"
-        elif 65 <= days_left <= 92 and (eps_gr or 0) >= 20 and dist_ema20 <= 3.5:
-            score += 7
-            regime = "⚡ POST-RESULT PULLBACK BUY"
-        else: score += 3
-    elif (est_eps_gr or 0) >= 15 and dist_ema20 <= 2.5:
-        score += 6
-        regime = "🔮 ESTIMATE BEAT ACCUMULATION"
+            regime = "⏳ EARLY PRE-RESULT COIL"
+        elif 65 <= days_left <= 92 and (eps_gr or 0) >= 20 and dist_ema20 <= 3.0:
+            score += 8
+            regime = "⚡ POST-ER PULLBACK CONTINUATION"
+        else:
+            score += 3
+    elif (est_eps_gr or 0) >= 15 and dist_ema20 <= 2.5 and val_safe:
+        score += 7
+        regime = "🔮 CONSENSUS BEAT STEALTH COIL"
 
     if missing >= 2: score = min(score, 73)
     score = min(max(int(round(score)), 0), 100)
@@ -201,7 +240,9 @@ def process_scanner_data(df):
 
             rev_gr = safe_float(row.get('total_revenue_yoy_growth_fq'))
             eps_gr = safe_float(row.get('earnings_per_share_diluted_yoy_growth_fq'))
-            op_m = first_valid(row, ['operating_margin_ttm', 'operating_margin_fq'])
+            op_m_fq = safe_float(row.get('operating_margin_fq'))
+            op_m_ttm = safe_float(row.get('operating_margin_ttm'))
+            op_m = op_m_fq if op_m_fq is not None else op_m_ttm
             roe = first_valid(row, ['return_on_equity', 'return_on_equity_fq'])
             pe = safe_float(row.get('price_earnings_ttm'))
             pb = first_valid(row, ['price_book_fq', 'price_book_ratio'])
@@ -210,7 +251,10 @@ def process_scanner_data(df):
             target_1y = safe_float(row.get('price_target_1y'))
 
             e_date_str, days_left = parse_earnings_date(row.get('earnings_release_next_date'), ticker, nse_cat, today)
-            ai_score, decision, regime = evaluate_low_phase(sector, rsi, rvol, chg_1w, est_eps_gr, rev_gr, eps_gr, op_m, roe, pe, pb, de, days_left, cmp, ema20)
+            ai_score, decision, regime = evaluate_advance_motion(
+                sector, rsi, rvol, chg_1w, chg_1m, est_eps_gr, rev_gr, eps_gr,
+                op_m_fq, op_m_ttm, roe, pe, pb, de, days_left, cmp, ema20, ema50, atr
+            )
 
             anchor = min(cmp, max(ema20, cmp - 0.8 * atr))
             buy_low = round(anchor - (0.4 * atr), 2)
@@ -238,13 +282,15 @@ def process_scanner_data(df):
                 'Debt/Equity': round(de, 2) if de is not None else "", 'MCap (Cr)': mcap
             }
 
-            if isinstance(days_left, int) and 1 <= days_left <= LIBRARY_MAX_DAYS:
+            # 1. 30-Day Library: Exclude Day 0/1 noise so only actionable 2 to 45 day setups appear!
+            if isinstance(days_left, int) and 2 <= days_left <= LIBRARY_MAX_DAYS:
                 library_list.append(rec)
 
+            # 2. Strict Filter for "Quant-Fundy Logs" (Stealth Pre-Result & Low-Phase Gems)
             if isinstance(days_left, int) and days_left <= 1: continue
             if not (MIN_RSI <= rsi <= MAX_RSI) or chg_1w > MAX_1W_CHASE_PCT: continue
-            near_20 = -3.0 <= ((cmp - ema20) / ema20) * 100 <= 4.5 if ema20 > 0 else False
-            near_50 = -2.0 <= ((cmp - ema50) / ema50) * 100 <= 4.5 if ema50 > 0 else False
+            near_20 = -3.0 <= ((cmp - ema20) / ema20) * 100 <= 4.0 if ema20 > 0 else False
+            near_50 = -2.0 <= ((cmp - ema50) / ema50) * 100 <= 4.0 if ema50 > 0 else False
             if not (near_20 or near_50): continue
 
             is_fin = any(w in sector.lower() for w in ['finance', 'bank', 'insurance', 'investment'])
@@ -257,24 +303,21 @@ def process_scanner_data(df):
     q_df = pd.DataFrame(quant_setups)
     if not q_df.empty: q_df = q_df.sort_values(by=['AI Score', 'Max Growth (%)'], ascending=[False, False])
     l_df = pd.DataFrame(library_list)
-    if not l_df.empty: l_df = l_df.sort_values(by=['Days Left', 'AI Score'], ascending=[True, False])
+    if not l_df.empty: l_df = l_df.sort_values(by=['AI Score', 'Days Left'], ascending=[False, True])
     return q_df, l_df.to_dict(orient='records'), price_map
 
 def push_notifications(quant_df, library_list, price_map):
     token, chat_id, webhook = os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID'), os.getenv('WEBHOOK_URL')
     today_str = str(datetime.date.today())
 
-    # 1. Send Telegram Alert First
     if token and chat_id and not quant_df.empty:
         try:
             top_df = quant_df[['Ticker', 'Days Left', 'CMP', 'Buy Low', 'Min Target', 'Max Growth (%)']].head(12)
-            msg = f"<b>💎 V6.0 LOW-PHASE PRE-EVENT GEMS ({len(quant_df)})</b>\n<pre>{top_df.to_string(index=False)}</pre>"
-            tg_res = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, timeout=15)
-            print(f"Telegram Status: {tg_res.status_code}")
+            msg = f"<b>🕵️ V7.0 ADVANCE MOTION PRE-RESULT GEMS ({len(quant_df)})</b>\n<pre>{top_df.to_string(index=False)}</pre>"
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, timeout=15)
         except Exception as e:
             print(f"Telegram Warning: {e}")
 
-    # 2. Push to Google Sheets with 90s Timeout & Safe Exception Handling
     if webhook:
         try:
             payload = {
@@ -287,13 +330,11 @@ def push_notifications(quant_df, library_list, price_map):
             res = requests.post(webhook, json=payload, headers={'Content-Type': 'application/json'}, timeout=90)
             print(f"Sheets Webhook: {res.status_code} | {res.text[:150]}")
         except Exception as e:
-            print(f"Sheets Webhook Warning (Data still processed by Google in background): {e}")
+            print(f"Sheets Webhook Warning: {e}")
 
 if __name__ == "__main__":
     raw_df = fetch_nse_market_data()
     quant_df, library_list, price_map = process_scanner_data(raw_df)
-    print(f"Gems Found: {len(quant_df)} | 30-Day Catalysts: {len(library_list)}")
-    if not quant_df.empty:
-        print(quant_df[['Regime', 'AI Score', 'Ticker', 'Days Left', 'CMP', 'Buy Low', 'Min Target', 'Max Growth (%)']].head(15).to_string(index=False))
+    print(f"Stealth Gems Found: {len(quant_df)} | Actionable Upcoming Catalysts: {len(library_list)}")
     push_notifications(quant_df, library_list, price_map)
 # --- END OF SCRIPT ---
