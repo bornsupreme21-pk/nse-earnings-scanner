@@ -177,6 +177,7 @@ def evaluate_advance_motion(
     return score, decision, regime
 
 def fetch_nse_market_data():
+    """Scans the ENTIRE liquid NSE Universe (up to 2,500 stocks, not just top 750) in 1 request."""
     base_cols = [
         'name', 'sector', 'close', 'high', 'low', 'change', 'Perf.W', 'Perf.1M',
         'volume', 'average_volume_30d_calc', 'relative_volume_10d_calc',
@@ -191,14 +192,19 @@ def fetch_nse_market_data():
     for col_set in [ext_cols, base_cols]:
         try:
             q = (Query().set_markets('india').select(*col_set)
-                 .where(Column('exchange') == 'NSE', Column('close') >= MIN_PRICE_FILTER, Column('average_volume_30d_calc') > 50000)
-                 .order_by('market_cap_basic', ascending=False).limit(750))
+                 .where(
+                     Column('exchange') == 'NSE',
+                     Column('close') >= MIN_PRICE_FILTER,
+                     Column('average_volume_30d_calc') > 50000
+                 )
+                 .order_by('market_cap_basic', ascending=False)
+                 .limit(2500))  # <-- EXPANDED FROM 750 TO 2500 (Full Liquid NSE Universe)
             _, df = q.get_scanner_data()
+            print(f"Scanned {len(df)} liquid NSE stocks across the entire market.")
             return df
         except Exception:
             continue
     return pd.DataFrame()
-
 def process_scanner_data(df):
     today = datetime.date.today()
     today_str = str(today)
